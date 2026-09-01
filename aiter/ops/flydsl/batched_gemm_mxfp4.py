@@ -126,6 +126,9 @@ def flydsl_batched_gemm_mxfp4(
         tile_k,
         a_dtype,
         out_dtype,
+        # B operand is always MXFP4 here (see the function name / docstring);
+        # launch_gemm grew b_dtype when FlyDSL added the a8w8 (fp8 B) path.
+        "fp4",
         B,
         *strides,
         0,
