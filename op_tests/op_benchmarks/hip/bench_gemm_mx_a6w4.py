@@ -1,148 +1,123 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Compare the gfx950 MX GEMM formats: a6w4 vs a6w6, a8w4, a4w4.
+"""Compare the gfx950 MX GEMM formats -- a6w4 vs a6w6, a8w4, a4w4 -- on real
+DeepSeek-R1 (TP=8) and Qwen3.8-27B (TP=1) linear shapes, swept over batch size.
 
 Every path starts from the *same* bf16 tensors and then runs its own canonical
-aiter quantization pipeline, so the comparison is between formats rather than
-between quantizers:
+aiter quantization pipeline, so this compares formats, not quantizers:
 
   * a4w4 / a6w4 / a8w4 (FlyDSL) share one kernel and differ only in ``a_dtype``,
     which isolates activation precision exactly at fixed MXFP4 weights.
-  * a4w4 (asm) and a6w6 (asm) are aiter's production paths and act as the
-    reality check on the FlyDSL arm.
+  * a4w4 and a6w6 (asm) are aiter's production paths and are the reality check.
 
-Tuning: the asm paths auto-select a shape-tuned kernel; the FlyDSL arm uses
-``pick_mx_tiles``, which measured within ~9% of an exhaustive tile sweep on
-these shapes. Pass ``--sweep`` to tile-sweep the FlyDSL arm instead.
+All paths are tuned: the asm paths auto-select a shape-tuned kernel, and the
+FlyDSL arm goes through pick_mx_tiles, which consults
+aiter/configs/a6w4_flydsl_tuned_gemm.csv (regenerate with
+tune_gemm_mx_a6w4.py in this directory).
 
-Note the inputs are Gaussian, which is the *best* case for low-bit weights --
-real LLM tensors have outliers that MXFP4 handles far worse than MXFP6, so the
-a4w4-vs-a6w4 accuracy gap here is a lower bound.
+Inputs are Gaussian, which is the *best* case for low-bit weights -- real
+tensors have outliers that MXFP4 handles far worse than MXFP6, so the
+a4w4-vs-a6w4 accuracy gap reported here is a lower bound.
 
 Usage:
-    python op_tests/op_benchmarks/hip/bench_gemm_mx_a6w4.py [--sweep]
+    python op_tests/op_benchmarks/hip/bench_gemm_mx_a6w4.py [--shapes r1.]
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import sys
 import time
 
 import torch
 
-DEFAULT_SHAPES = [
-    (1, 4096, 4096),
-    (128, 4096, 4096),
-    (1024, 4096, 4096),
-    (4096, 4096, 4096),
-    (2048, 8192, 8192),
-]
-SWEEP_TILES = list(itertools.product((32, 64, 128, 256), (64, 128, 256), (128, 256)))
+from tune_gemm_mx_a6w4 import BATCH_SIZES, SHAPES
+
+ITERS, WARMUP = 20, 5
+PATHS = ["a4w4-fly", "a6w4-fly", "a8w4-fly", "a6w6-asm", "a4w4-asm", "bf16"]
 
 
-def _bench(fn, iters: int = 100, warmup: int = 25) -> float:
-    """Microseconds per call: min over 3 reps of the mean, to suppress noise."""
-    for _ in range(warmup):
+def _bench(fn) -> float:
+    for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
     best = float("inf")
     for _ in range(3):
         t0 = time.perf_counter()
-        for _ in range(iters):
+        for _ in range(ITERS):
             fn()
         torch.cuda.synchronize()
-        best = min(best, (time.perf_counter() - t0) / iters * 1e6)
+        best = min(best, (time.perf_counter() - t0) / ITERS * 1e6)
     return best
 
 
-def _rel(out: torch.Tensor, ref: torch.Tensor) -> float:
-    return float(
-        torch.linalg.vector_norm(out.float() - ref) / torch.linalg.vector_norm(ref)
-    )
+def _rel(out, ref) -> float:
+    return float(torch.linalg.vector_norm(out.float() - ref)
+                 / torch.linalg.vector_norm(ref))
 
 
-def _flydsl_entries(x, w, N, ref, sweep):
-    from aiter.ops.flydsl.batched_gemm_mxfp4 import (
-        flydsl_gemm_mxfp4,
-        preshuffle_mx_weight,
-        quant_mx_act,
-        tiles_are_valid,
-    )
+def _runners(x_max, w, N, K):
+    """Build {path: callable(M) -> out} for every format, prepped once."""
+    import aiter
+    import aiter.ops.flydsl.batched_gemm_mxfp4 as bg
 
-    _, K = x.shape
-    w_codes, w_scales = preshuffle_mx_weight(w)
-    out = []
-    for a_dtype, name in (("fp4", "a4w4-flydsl"), ("fp6", "a6w4-flydsl"),
-                          ("fp8", "a8w4-flydsl")):
+    runners = {}
+
+    w_codes, w_scales = bg.preshuffle_mx_weight(w)
+    for a_dtype, name in (("fp4", "a4w4-fly"), ("fp6", "a6w4-fly"),
+                          ("fp8", "a8w4-fly")):
         try:
-            a_codes, a_scales = quant_mx_act(x, a_dtype)
+            quant = {M: bg.quant_mx_act(x_max[:M].contiguous(), a_dtype)
+                     for M in BATCH_SIZES}
         except Exception as exc:  # noqa: BLE001
-            print(f"  {name}: quant unavailable ({exc})", file=sys.stderr)
+            print(f"  {name} unavailable: {exc}", file=sys.stderr)
             continue
 
-        def call(tiles=None, a_codes=a_codes, a_scales=a_scales, a_dtype=a_dtype):
-            kw = {} if tiles is None else dict(
-                tile_m=tiles[0], tile_n=tiles[1], tile_k=tiles[2]
-            )
-            return flydsl_gemm_mxfp4(a_codes, w_codes, a_scales, w_scales, N,
-                                     torch.bfloat16, a_dtype=a_dtype, **kw)
+        def run(M, a_dtype=a_dtype, quant=quant):
+            a_codes, a_scales = quant[M]
+            return bg.flydsl_gemm_mxfp4(a_codes, w_codes, a_scales, w_scales, N,
+                                        torch.bfloat16, a_dtype=a_dtype)
+        runners[name] = run
 
-        if not sweep:
-            out.append((name, _bench(call), _rel(call(), ref), "pick_mx_tiles"))
-            continue
-        best = (float("inf"), None)
-        for tiles in SWEEP_TILES:
-            if not tiles_are_valid(*tiles, N, K, a_dtype):
-                continue
-            try:
-                call(tiles)
-                torch.cuda.synchronize()
-                us = _bench(lambda tiles=tiles: call(tiles))
-            except Exception:  # noqa: BLE001
-                continue
-            best = min(best, (us, tiles))
-        if best[1]:
-            out.append((name, best[0], _rel(call(best[1]), ref), str(best[1])))
-    return out
-
-
-def _asm_entries(x, w, M, N, K, ref):
-    out = []
     try:
         from aiter.ops.gemm_op_a6w6 import gemm_a6w6, quant_mxfp6_gemm
 
-        A, As = quant_mxfp6_gemm(x)
-        B, Bs = quant_mxfp6_gemm(w)
-        run = lambda: gemm_a6w6(A, B, As, Bs, M, N, K)  # noqa: E731
-        out.append(("a6w6-asm", _bench(run), _rel(run(), ref), "auto"))
+        Bq, Bs = quant_mxfp6_gemm(w)
+        packed = {M: quant_mxfp6_gemm(x_max[:M].contiguous()) for M in BATCH_SIZES}
+
+        def run_a6w6(M):
+            A, As = packed[M]
+            return gemm_a6w6(A, Bq, As, Bs, M, N, K)
+        runners["a6w6-asm"] = run_a6w6
     except Exception as exc:  # noqa: BLE001
         print(f"  a6w6-asm unavailable: {exc}", file=sys.stderr)
 
     try:
-        import aiter
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
         from aiter.ops.shuffle import shuffle_weight
 
         qf = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-        xq, xs = qf(x, shuffle=True)
         wq, ws = qf(w, shuffle=True)
         wsh = shuffle_weight(wq, layout=(16, 16))
-        run = lambda: gemm_a4w4(xq, wsh, xs, ws, bpreshuffle=True)  # noqa: E731
-        got = run()
-        got = got[0] if isinstance(got, tuple) else got
-        out.append(("a4w4-asm", _bench(run), _rel(got[:M], ref), "auto"))
+        xq = {M: qf(x_max[:M].contiguous(), shuffle=True) for M in BATCH_SIZES}
+
+        def run_a4w4(M):
+            a, a_s = xq[M]
+            got = gemm_a4w4(a, wsh, a_s, ws, bpreshuffle=True)
+            got = got[0] if isinstance(got, tuple) else got
+            return got[:M]
+        runners["a4w4-asm"] = run_a4w4
     except Exception as exc:  # noqa: BLE001
         print(f"  a4w4-asm unavailable: {exc}", file=sys.stderr)
-    return out
+
+    runners["bf16"] = lambda M: x_max[:M] @ w.T
+    return runners
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--sweep", action="store_true",
-                    help="tile-sweep the FlyDSL arm instead of using pick_mx_tiles")
+    ap.add_argument("--shapes", default="", help="substring filter on label")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -150,26 +125,34 @@ def main() -> int:
         return 1
     arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     if arch != "gfx950":
-        print(f"this benchmark is gfx950-only, got {arch}", file=sys.stderr)
+        print(f"gfx950-only benchmark, got {arch}", file=sys.stderr)
         return 1
 
-    for M, N, K in DEFAULT_SHAPES:
+    for label, N, K in [s for s in SHAPES if args.shapes in s[0]]:
         torch.manual_seed(0)
-        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.5
+        x_max = torch.randn(max(BATCH_SIZES), K, device="cuda",
+                            dtype=torch.bfloat16) * 0.5
         w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.5
-        ref = x.float() @ w.float().T
-        flops = 2 * M * N * K
+        runners = _runners(x_max, w, N, K)
+        order = [p for p in PATHS if p in runners]
 
-        entries = _flydsl_entries(x, w, N, ref, args.sweep)
-        entries += _asm_entries(x, w, M, N, K, ref)
-        run = lambda: x @ w.T  # noqa: E731
-        entries.append(("bf16", _bench(run), 0.0, "-"))
+        # Accuracy is a property of the format, not the batch size; report once.
+        ref = x_max[:64].float() @ w.float().T
+        errs = {p: _rel(runners[p](64), ref) for p in order}
 
-        print(f"\n=== M={M} N={N} K={K} ===")
-        print(f"{'path':<14} {'us':>9} {'TFLOP/s':>9} {'rel err':>10}  config")
-        for name, us, rel, cfg in sorted(entries, key=lambda e: e[1]):
-            print(f"{name:<14} {us:9.1f} {flops / (us / 1e6) / 1e12:9.1f} "
-                  f"{rel:10.3e}  {cfg}")
+        print(f"\n=== {label}  N={N} K={K} "
+              f"({ITERS} iters, {WARMUP} warmup) ===")
+        print("rel err: " + "  ".join(f"{p.split('-')[0]} {errs[p]:.3e}"
+                                      for p in order if p != "bf16"))
+        print(f"{'M':>5} " + " ".join(f"{p:>10}" for p in order))
+        for M in BATCH_SIZES:
+            us = {p: _bench(lambda p=p, M=M: runners[p](M)) for p in order}
+            fastest = min(us, key=us.get)
+            cells = []
+            for p in order:
+                mark = "*" if p == fastest else " "
+                cells.append(f"{us[p]:9.1f}{mark}")
+            print(f"{M:>5} " + " ".join(cells))
     return 0
 
 

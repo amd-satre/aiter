@@ -11,7 +11,9 @@ as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
 
+import csv
 import functools
+import os
 
 import torch
 
@@ -512,14 +514,45 @@ def flydsl_batched_gemm_a8w4_v2(
 # a8w4 lives on gfx950 (aiter's gemm_a8w4_mxfp8 asm path is gfx1250-only).
 _MX_A_SUPPORTED = ("fp4", "fp6", "fp8")
 
-# Shapes where a sweep beat the preference order, keyed by
-# (m_bucket, N, K, a_dtype). Empty until a broader tuning run lands;
-# pick_mx_tiles falls through to the search below.
+# In-process overrides, keyed by (M, N, K, a_dtype). Takes precedence over the
+# tuned CSV; mainly for tuners and tests.
 MX_TUNED_TILES: dict[tuple[int, int, int, str], tuple[int, int, int]] = {}
 
-# M is bucketed (rounded UP) so one compiled config serves a range of batch
-# sizes instead of recompiling per token count.
-_M_BUCKETS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+# Shape-tuned tiles, same spirit as aiter/configs/a6w6_blockscale_tuned_gemm.csv:
+# exact (gfx, cu_num, M, N, K, a_dtype) matches only, everything else falls
+# through to the heuristic in pick_mx_tiles. Regenerate with
+# op_tests/op_benchmarks/hip/tune_gemm_mx_a6w4.py.
+MX_TUNED_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "configs",
+    "a6w4_flydsl_tuned_gemm.csv",
+)
+
+
+@functools.cache
+def _load_mx_tuned_csv() -> dict[tuple[str, int, int, int, int, str],
+                                 tuple[int, int, int]]:
+    if not os.path.exists(MX_TUNED_CSV):
+        return {}
+    table: dict[tuple[str, int, int, int, int, str], tuple[int, int, int]] = {}
+    with open(MX_TUNED_CSV, newline="") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                key = (row["gfx"].strip(), int(row["cu_num"]), int(row["M"]),
+                       int(row["N"]), int(row["K"]), row["a_dtype"].strip())
+                tiles = (int(row["tile_m"]), int(row["tile_n"]),
+                         int(row["tile_k"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"{MX_TUNED_CSV}: bad row {row!r}") from exc
+            if key in table:
+                raise ValueError(f"{MX_TUNED_CSV}: duplicate key {key}")
+            table[key] = tiles
+    return table
+
+
+def clear_mx_tuned_cache() -> None:
+    """Drop the cached tuned table after a tuner rewrites the CSV."""
+    _load_mx_tuned_csv.cache_clear()
 
 
 @functools.cache
@@ -532,12 +565,6 @@ def _cu_count() -> int:
     except Exception:  # noqa: BLE001
         return 256  # MI355X
 
-
-def _m_bucket(m: int) -> int:
-    for b in _M_BUCKETS:
-        if m <= b:
-            return b
-    return _M_BUCKETS[-1]
 
 
 def tiles_are_valid(
@@ -585,31 +612,44 @@ def pick_mx_tiles(
     if K % 256 != 0:
         raise RuntimeError(f"[FlyDSL] K ({K}) must be a multiple of 256")
 
-    tuned = MX_TUNED_TILES.get((_m_bucket(M), N, K, a_dtype))
+    tuned = MX_TUNED_TILES.get((M, N, K, a_dtype))
+    if tuned is not None:
+        return tuned
+    tuned = _load_mx_tuned_csv().get(
+        (get_gfx(), _cu_count(), M, N, K, a_dtype)
+    )
     if tuned is not None:
         return tuned
 
-    # Measured: tile_m=32 wins all the way up to M=1024 (a wider M tile just
-    # lowers occupancy without helping, since these shapes stay N/K-bound), and
-    # only at M>1024 does 128 pay off. An earlier bucketing that grew tile_m
-    # through a 64 band was 38%/32% off the best at M=128/1024.
-    m_pref = (32, 64, 128, 256) if M <= 1024 else (128, 64, 256, 32)
+    # tile_m: a sweep over the R1 / Qwen3.8-27B shapes picks 32 for essentially
+    # every M up to 128 and splits between 32/64/128 above that, so grow it only
+    # slowly. A wider M tile mostly costs occupancy on these N/K-heavy shapes.
+    if M <= 128:
+        m_pref = (32, 64, 128, 256)
+    elif M <= 512:
+        m_pref = (64, 32, 128, 256)
+    else:
+        m_pref = (128, 64, 32, 256)
     n_pref = sorted((t for t in (256, 128, 64) if N % t == 0), reverse=True)
     if not n_pref:
         raise RuntimeError(
             f"[FlyDSL] N ({N}) must be a multiple of 64 for the MX preshuffle GEMM"
         )
 
-    # Fat N tiles are only worth it if the grid still fills the device. At
-    # M=128/N=4096, tile_n=256 leaves ceil(128/32) * (4096/256) = 64 workgroups
-    # for 256 CUs and ran 31% slower than a narrower tile that fills it. So make
-    # one pass that insists on covering the CUs, then fall back to plain
-    # preference order for shapes too small to cover them at any tile.
+    # Fat N tiles are only worth it if the grid still fills the device. First
+    # pass takes the widest tile_n that still covers the CUs. If nothing covers
+    # them -- the common case for decode-shaped M -- the second pass runs tile_n
+    # ascending instead, because then the goal flips to *maximising* workgroups:
+    # over the tuned R1 / Qwen3.8-27B rows the underfilled cases chose tile_n=64
+    # 127 times against 39 for tile_n=256.
     cu = _cu_count()
-    for require_occupancy in (True, False):
-        for tile_n in n_pref:
+    for tile_n_order in (n_pref, sorted(n_pref)):
+        require_occupancy = tile_n_order is n_pref
+        for tile_n in tile_n_order:
             for tile_m in m_pref:
-                for tile_k in (128, 256):
+                # tile_k=256 won at every K in the tuned sweep (loop overhead
+                # dominates the extra pipelining a 128 chunk buys).
+                for tile_k in (256, 128):
                     if not tiles_are_valid(tile_m, tile_n, tile_k, N, K, a_dtype):
                         continue
                     if require_occupancy:
