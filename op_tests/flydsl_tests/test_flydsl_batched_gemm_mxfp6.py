@@ -96,3 +96,58 @@ def test_flydsl_batched_gemm_mxfp4_a_dtypes(a_dtype, B):
         out.reshape(-1, N).float() - ref
     ) / torch.linalg.vector_norm(ref)
     assert rel < 1e-2, f"relative error {rel:.4e} too high (a_dtype={a_dtype}, B={B})"
+
+
+@pytest.mark.parametrize("a_dtype", ["fp4", "fp6"])
+def test_pick_mx_tiles_only_returns_valid_combos(a_dtype):
+    """pick_mx_tiles must never hand the kernel a combination it asserts on.
+
+    The kernel's constraints are not all obvious -- notably the A tile must be a
+    whole number of ``num_threads*16``-byte cooperative DMA rounds, which couples
+    tile_m/tile_k/tile_n *and* a_dtype -- so this sweeps the shape space rather
+    than spot-checking.
+    """
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import pick_mx_tiles, tiles_are_valid
+
+    for N in (512, 1024, 4096, 8192, 5120):
+        for K in (256, 1024, 4096, 8192):
+            for M in (1, 7, 32, 33, 128, 1024, 4096, 32768):
+                tm, tn, tk = pick_mx_tiles(M, N, K, a_dtype)
+                assert tiles_are_valid(tm, tn, tk, N, K, a_dtype), (
+                    f"pick_mx_tiles({M},{N},{K},{a_dtype}) -> {(tm, tn, tk)} "
+                    "violates the kernel constraints"
+                )
+
+
+@pytest.mark.parametrize("a_dtype", ["fp4", "fp6"])
+@pytest.mark.parametrize("M", [1, 33, 128])
+def test_flydsl_gemm_mxfp4_2d(a_dtype, M):
+    """The un-batched 2D entry point, driven through the public prep helpers."""
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import (
+        flydsl_gemm_mxfp4,
+        preshuffle_mx_weight,
+        quant_mx_act,
+    )
+    from aiter.ops.quant import per_1x32_f4_quant
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    N, K = 1024, 4096
+
+    w = torch.randn(N, K, device=device, dtype=torch.bfloat16) * 0.5
+    w_codes, w_scales = preshuffle_mx_weight(w)
+    x = torch.randn(M, K, device=device, dtype=torch.bfloat16) * 0.5
+    a_codes, a_scales = quant_mx_act(x, a_dtype)
+
+    out = flydsl_gemm_mxfp4(
+        a_codes, w_codes, a_scales, w_scales, N, torch.bfloat16, a_dtype=a_dtype
+    )
+    assert tuple(out.shape) == (M, N)
+
+    w_q, w_scale = per_1x32_f4_quant(w.float())[:2]
+    w_deq = mxfp4_to_f32(w_q) * e8m0_to_f32(w_scale.repeat_interleave(32, dim=1))
+    ref = x.float() @ w_deq.T
+    rel = torch.linalg.vector_norm(out.float() - ref) / torch.linalg.vector_norm(ref)
+    # Tolerances are the activation quantization error of each format: MXFP6-E2M3
+    # lands ~3e-2 (about 31 dB SQNR), MXFP4-E2M1 ~1.2e-1 (about 19 dB).
+    assert rel < (0.06 if a_dtype == "fp6" else 0.25), f"rel={rel:.4e}"
