@@ -151,3 +151,44 @@ def test_flydsl_gemm_mxfp4_2d(a_dtype, M):
     # Tolerances are the activation quantization error of each format: MXFP6-E2M3
     # lands ~3e-2 (about 31 dB SQNR), MXFP4-E2M1 ~1.2e-1 (about 19 dB).
     assert rel < (0.06 if a_dtype == "fp6" else 0.25), f"rel={rel:.4e}"
+
+
+@pytest.mark.parametrize("M", [1, 8, 32])
+def test_split_k_matches_single_k(M):
+    """Split-K must be numerically identical, not merely close.
+
+    launch_gemm accumulates each split in fp32 and launch_splitk_reduce sums
+    them, so the only difference from k_batch=1 is summation order over fp32
+    partials -- which for these shapes reproduces exactly.
+    """
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import (
+        flydsl_gemm_mxfp4,
+        pick_mx_split_k,
+        pick_mx_tiles,
+        preshuffle_mx_weight,
+        quant_mx_act,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    N, K = 4096, 7168
+
+    w = torch.randn(N, K, device=device, dtype=torch.bfloat16) * 0.5
+    w_codes, w_scales = preshuffle_mx_weight(w)
+    x = torch.randn(M, K, device=device, dtype=torch.bfloat16) * 0.5
+    a_codes, a_scales = quant_mx_act(x, "fp6")
+
+    tiles = pick_mx_tiles(M, N, K, "fp6")
+    k_batch = pick_mx_split_k(M, N, K, *tiles)
+    assert k_batch > 1, (
+        f"expected split-K to engage at M={M} (grid would be "
+        f"{-(-M // tiles[0]) * (N // tiles[1])} workgroups)"
+    )
+
+    def run(kb):
+        return flydsl_gemm_mxfp4(a_codes, w_codes, a_scales, w_scales, N,
+                                 torch.bfloat16, a_dtype="fp6",
+                                 tile_m=tiles[0], tile_n=tiles[1],
+                                 tile_k=tiles[2], k_batch=kb)
+
+    torch.testing.assert_close(run(k_batch), run(1), rtol=0, atol=0)
